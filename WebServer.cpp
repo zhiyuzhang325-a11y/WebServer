@@ -28,9 +28,9 @@ string getTimestamp() {
 
 void logger(LOGLEVEL level, string message) {
     if (level == ERROR || level == FATAL) {
-        cout << getTimestamp << " " << level << ": " << message << " : " << strerror(errno) << endl;
+        cout << getTimestamp() << " " << level << ": " << message << " : " << strerror(errno) << endl;
     } else {
-        cout << getTimestamp << " " << level << ": " << message << endl;
+        cout << getTimestamp() << " " << level << ": " << message << endl;
     }
 }
 
@@ -58,8 +58,8 @@ void ET(int epollfd, int listenfd, epoll_event *events, int numbers) {
             sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             int connfd = accept(listenfd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
-            string client_ip;
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), sizeof(client_ip));
+            string client_ip(INET_ADDRSTRLEN, '\0');
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
             int client_port = ntohs(client_addr.sin_port);
             logger(INFO, client_ip + " " + to_string(client_port));
             addfd(epollfd, connfd);
@@ -84,6 +84,7 @@ void ET(int epollfd, int listenfd, epoll_event *events, int numbers) {
                     close(fd);
                     break;
                 }
+                recvd += n;
             }
         } else {
             logger(WARN, "something else happened");
