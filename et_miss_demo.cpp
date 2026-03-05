@@ -8,8 +8,8 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 using namespace std;
-#define BUFSIZE 4096
 #define MAXSIZE 1024
+int BUFSIZE = 4096;
 
 enum LOGLEVEL {
     DEBUG, // 调试
@@ -34,11 +34,10 @@ void logger(LOGLEVEL level, string message) {
     }
 }
 
-int setnonblocking(int fd) {
+void setnonblocking(int fd) {
     int old_option = fcntl(fd, F_GETFL);
     int new_option = old_option | O_NONBLOCK;
     fcntl(fd, F_SETFL, new_option);
-    return old_option;
 }
 
 void addfd(int epollfd, int fd) {
@@ -49,6 +48,44 @@ void addfd(int epollfd, int fd) {
     setnonblocking(fd);
 }
 
+void ET_miss(int epollfd, int listenfd, epoll_event *events, int numbers) {
+    BUFSIZE = 10;
+    string buffer(BUFSIZE, '\0');
+    for (int i = 0; i < numbers; i++) {
+        int fd = events[i].data.fd;
+        if (fd == listenfd) {
+            sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int connfd = accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+            string client_ip(INET_ADDRSTRLEN, '\0');
+            int client_port = ntohs(client_addr.sin_port);
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), INET_ADDRSTRLEN);
+            logger(INFO, "connect with " + client_ip + " " + to_string(client_port));
+            addfd(epollfd, connfd);
+        } else if (events[i].events & EPOLLIN) {
+            memset(buffer.data(), '\0', BUFSIZE);
+            int n = recv(fd, buffer.data(), BUFSIZE, 0);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    logger(INFO, "read success, buffer is : " + buffer);
+                    string response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello\n";
+                    send(fd, response.c_str(), response.size(), 0);
+                } else {
+                    logger(ERROR, "recv failed");
+                    close(fd);
+                }
+            } else if (n == 0) {
+                logger(WARN, "client closed");
+                close(fd);
+            } else {
+                logger(WARN, "had read buffer is : " + buffer);
+            }
+        } else {
+            logger(WARN, "something else happened");
+        }
+    }
+}
+
 void ET(int epollfd, int listenfd, epoll_event *events, int numbers) {
     string buffer(BUFSIZE, '\0');
     for (int i = 0; i < numbers; i++) {
@@ -56,10 +93,10 @@ void ET(int epollfd, int listenfd, epoll_event *events, int numbers) {
         if (fd == listenfd) {
             sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
-            int connfd = accept(listenfd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+            int connfd = accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
             string client_ip(INET_ADDRSTRLEN, '\0');
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
             int client_port = ntohs(client_addr.sin_port);
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), INET_ADDRSTRLEN);
             logger(INFO, "connect with " + client_ip + " " + to_string(client_port));
             addfd(epollfd, connfd);
         } else if (events[i].events & EPOLLIN) {
@@ -69,21 +106,22 @@ void ET(int epollfd, int listenfd, epoll_event *events, int numbers) {
                 int n = recv(fd, buffer.data() + recvd, BUFSIZE - recvd, 0);
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        logger(INFO, "had read over, buffer is : " + buffer);
+                        logger(INFO, "read success, buffer is : " + buffer);
                         string response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello\n";
                         send(fd, response.c_str(), response.size(), 0);
                         break;
-                    } else {
-                        logger(ERROR, "read failed");
-                        close(fd);
-                        break;
                     }
-                } else if (n == 0) {
-                    logger(WARN, "client is closed");
+                    logger(ERROR, "recv failed");
                     close(fd);
                     break;
+                } else if (n == 0) {
+                    logger(WARN, "client closed");
+                    close(fd);
+                    break;
+                } else {
+                    recvd += n;
+                    logger(WARN, "had read buffer is : " + buffer);
                 }
-                recvd += n;
             }
         } else {
             logger(WARN, "something else happened");
@@ -96,9 +134,9 @@ int main(int argc, char *argv[]) {
         logger(ERROR, "argv is too little");
         return -1;
     }
-
     string ip(argv[1]);
     int port = stoi(argv[2]);
+
     sockaddr_in addr;
     memset(&addr, '\0', sizeof(addr));
     addr.sin_family = AF_INET;
@@ -110,15 +148,8 @@ int main(int argc, char *argv[]) {
         logger(ERROR, "socket failed");
     }
     int ret = bind(listenfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-    if (ret < 0) {
-        logger(ERROR, "bind faile");
-    }
-    ret = listen(listenfd, 1024);
-    if (ret < 0) {
-        logger(ERROR, "bind failed");
-    }
-
-    logger(INFO, "socket successed, and now is listening");
+    listen(listenfd, 1024);
+    logger(INFO, "socket success, is listening");
 
     epoll_event events[MAXSIZE];
     int epollfd = epoll_create(1);
@@ -136,6 +167,3 @@ int main(int argc, char *argv[]) {
     close(epollfd);
     return 0;
 }
-/*
-127.0.0.1 8080
-*/
