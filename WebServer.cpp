@@ -8,7 +8,7 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 using namespace std;
-#define BUFSIZE 10
+#define BUFSIZE 4096
 #define MAXSIZE 1024
 
 enum LOGLEVEL {
@@ -43,8 +43,7 @@ int setnonblocking(int fd) {
 
 void addfd(int epollfd, int fd) {
     epoll_event event;
-    event.events |= EPOLLET;
-    event.events |= EPOLLIN;
+    event.events = EPOLLET | EPOLLIN;
     event.data.fd = fd;
     epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
     setnonblocking(fd);
@@ -61,7 +60,7 @@ void ET(int epollfd, int listenfd, epoll_event *events, int numbers) {
             string client_ip(INET_ADDRSTRLEN, '\0');
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
             int client_port = ntohs(client_addr.sin_port);
-            logger(INFO, client_ip + " " + to_string(client_port));
+            logger(INFO, "connect with " + client_ip + " " + to_string(client_port));
             addfd(epollfd, connfd);
         } else if (events[i].events & EPOLLIN) {
             memset(buffer.data(), '\0', BUFSIZE);
