@@ -18,7 +18,7 @@ using namespace std;
 #define MAXSIZE 1024
 #define BUFSIZE 4096
 
-string body(1024 * 1024, 'A');
+string body = "Hello";
 string default_response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(body.size()) + "\r\n\r\n" + body;
 
 int epollfd;
@@ -34,7 +34,13 @@ struct Connection {
 };
 unordered_map<int, Connection> conns;
 
-queue<int> readyQueue;
+struct TaskResult {
+    int fd;
+    string response;
+
+    TaskResult(int f, string &r) : fd(f), response(r) {}
+};
+queue<TaskResult> readyQueue;
 mutex readyMutex;
 mutex logMutex;
 
@@ -142,16 +148,14 @@ class Task {
         logger(INFO, "Task processing fd = " + to_string(m_fd) + " by thread " + to_string(pthread_self()));
 
         // 模拟耗时操作
-        this_thread::sleep_for(chrono::milliseconds(500));
+        // this_thread::sleep_for(chrono::milliseconds(500));
 
         string response = default_response;
         {
             lock_guard<mutex> lock(readyMutex);
             if (conns.find(m_fd) != conns.end()) {
                 logger(INFO, "fd = " + to_string(m_fd) + " send data : " + conns[m_fd].inbuf);
-                conns[m_fd].outbuf = response;
-                conns[m_fd].processing = false;
-                readyQueue.emplace(m_fd);
+                readyQueue.emplace(m_fd, response);
             }
         }
 
@@ -203,12 +207,14 @@ void trySend(Connection &conn) {
             return;
         }
     }
+    logger(DEBUG, "fd = " + to_string(conn.fd) + " send over");
     conn.sendComplete = true;
     if (conn.readClosed) {
         logger(INFO, "send complete, close fd = " + to_string(conn.fd));
         close(conn.fd);
     } else {
-        modfd(conn.fd, EPOLLET | EPOLLIN);
+        logger(INFO, "send complete, close fd = " + to_string(conn.fd));
+        close(conn.fd);
     }
 }
 
@@ -252,28 +258,43 @@ int main(int argc, char *argv[]) {
             int fd = events[i].data.fd;
             logger(DEBUG, "event fd = " + to_string(fd));
             if (fd == listenfd) {
-                sockaddr_in client_addr{};
-                socklen_t client_len = sizeof(client_addr);
-                int connfd = accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
-                if (connfd < 0) continue;
+                while (1) {
+                    sockaddr_in client_addr{};
+                    socklen_t client_len = sizeof(client_addr);
+                    int connfd = accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+                    if (connfd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        }
+                        logger(ERROR, "accept failed");
+                        break;
+                    }
 
-                addfd(connfd);
-                conns[connfd] = {connfd, "", "", false, false, false};
-                string client_ip;
-                int client_port = ntohs(client_addr.sin_port);
-                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
-                logger(INFO, "new connection, fd = " + to_string(connfd) + " ip = " + client_ip + ":" + to_string(client_port));
+                    addfd(connfd);
+                    conns[connfd] = {connfd, "", "", false, false, false};
+                    string client_ip;
+                    int client_port = ntohs(client_addr.sin_port);
+                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
+                    logger(INFO, "new connection, fd = " + to_string(connfd) + " ip = " + client_ip + ":" + to_string(client_port));
+                }
             } else if (fd == notifyfd) {
                 uint64_t val;
                 read(notifyfd, &val, sizeof(val));
 
-                queue<int> localQueue;
+                queue<TaskResult> localQueue;
                 {
                     lock_guard<mutex> lock(readyMutex);
                     localQueue.swap(readyQueue);
                 }
+
+                logger(DEBUG, "start processing queue, queue len = " + to_string(localQueue.size()));
                 while (!localQueue.empty()) {
-                    trySend(conns[localQueue.front()]);
+                    auto &result = localQueue.front();
+                    if (conns.find(result.fd) != conns.end()) {
+                        conns[result.fd].outbuf = result.response;
+                        conns[result.fd].processing = false;
+                        trySend(conns[result.fd]);
+                    }
                     localQueue.pop();
                 }
             } else if (events[i].events & EPOLLIN) {
@@ -293,6 +314,7 @@ int main(int argc, char *argv[]) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             if (!conns[fd].processing && !conns[fd].sendComplete) {
                                 conns[fd].processing = true;
+                                logger(DEBUG, "enqueue task for fd = " + to_string(fd));
                                 pool.enqueue(new Task(fd));
                             }
                             break;
