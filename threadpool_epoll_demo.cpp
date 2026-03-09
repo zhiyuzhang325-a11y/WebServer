@@ -265,7 +265,10 @@ class Task {
                 } else if (req.target == "/echo") {
                     response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(body.size()) + "\r\n\r\n" + req.body;
                 } else if (req.method == "GET") {
-                    int filefd = open("static/index.html", O_RDONLY);
+                    string file_path = "static" + req.target;
+                    if (req.target == "/") file_path = "static/index.html";
+                    logger(INFO, "file path is " + file_path);
+                    int filefd = open(file_path.c_str(), O_RDONLY);
                     if (filefd == -1) {
                         response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                     } else {
