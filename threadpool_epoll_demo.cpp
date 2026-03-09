@@ -7,8 +7,10 @@
 #include <mutex>
 #include <netinet/in.h>
 #include <queue>
+#include <sstream>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -20,6 +22,7 @@ using namespace std;
 
 string body = "Hello";
 string default_response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(body.size()) + "\r\n\r\n" + body;
+string error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
 
 int epollfd;
 int notifyfd;
@@ -68,6 +71,105 @@ void logger(LOGLEVEL level, string message) {
     } else {
         cout << getTimestamp() << " " << level << ": " << message << endl;
     }
+}
+
+// 解析http请求状态机
+
+enum ParseState {
+    PARSE_REQUEST_LINE,
+    PARSE_HEADERS,
+    PARSE_BODY,
+    PARSE_DONE,
+    PARSE_ERROR
+};
+
+struct HttpRequest {
+    ParseState state = PARSE_REQUEST_LINE;
+
+    string method;
+    string target;
+    string version;
+
+    string host;
+    string content_type;
+    int content_length = 0;
+
+    string body;
+};
+
+ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
+    int index = 0;
+    size_t pos;
+    string line;
+    while (req.state == PARSE_BODY || (pos = raw.find("\r\n", index)) != string::npos) {
+        if (req.state == PARSE_REQUEST_LINE || req.state == PARSE_HEADERS) {
+            line = raw.substr(index, pos - index);
+            index = pos + 2;
+        }
+        switch (req.state) {
+        case PARSE_REQUEST_LINE: {
+            istringstream iss(line);
+            iss >> req.method >> req.target >> req.version;
+            if (req.method.empty() || req.target.empty() || req.version.empty()) {
+                logger(DEBUG, "request_line parse error");
+                req.state = PARSE_ERROR;
+                break;
+            }
+            if (req.method != "GET" && req.method != "POST" && req.method != "HEAD") {
+                logger(DEBUG, "request method error, method is " + req.method);
+                req.state = PARSE_ERROR;
+                break;
+            }
+            req.state = PARSE_HEADERS;
+            break;
+        }
+
+        case PARSE_HEADERS: {
+            if (line.empty()) {
+                if (req.content_length > 0) {
+                    req.state = PARSE_BODY;
+                } else {
+                    req.state = PARSE_DONE;
+                }
+                break;
+            }
+
+            size_t colon_pos = line.find(':');
+            if (colon_pos == string::npos) {
+                logger(DEBUG, "headers parse error");
+                req.state = PARSE_ERROR;
+                break;
+            }
+            string key = line.substr(0, colon_pos);
+            string value = line.substr(colon_pos + 2);
+
+            if (key.empty() || value.empty()) {
+                logger(DEBUG, "headers parse error");
+                req.state = PARSE_ERROR;
+            } else if (key == "Host") {
+                req.host = value;
+            } else if (key == "Content-Type") {
+                req.content_type = value;
+            } else if (key == "Content-Length") {
+                req.content_length = stoi(value);
+            }
+            break;
+        }
+
+        case PARSE_BODY: {
+            req.body = raw.substr(index, req.content_length);
+            req.state = PARSE_DONE;
+            return PARSE_DONE;
+        }
+
+        case PARSE_DONE:
+            return PARSE_DONE;
+
+        case PARSE_ERROR:
+            return PARSE_ERROR;
+        }
+    }
+    return req.state;
 }
 
 // 线程池
@@ -155,6 +257,28 @@ class Task {
             lock_guard<mutex> lock(readyMutex);
             if (conns.find(m_fd) != conns.end()) {
                 logger(INFO, "fd = " + to_string(m_fd) + " send data : " + conns[m_fd].inbuf);
+                HttpRequest req;
+                ParseState ret = parse_http_from_string(conns[m_fd].inbuf, req);
+                if (ret == PARSE_ERROR) {
+                    logger(INFO, "HTTP parse failed, fd = " + to_string(m_fd));
+                    response = error_response;
+                } else if (req.target == "/echo") {
+                    response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(body.size()) + "\r\n\r\n" + req.body;
+                } else if (req.method == "GET") {
+                    int filefd = open("static/index.html", O_RDONLY);
+                    if (filefd == -1) {
+                        response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    } else {
+                        struct stat st;
+                        fstat(filefd, &st);
+
+                        long file_size = st.st_size;
+                        string body(file_size, '\0');
+                        read(filefd, body.data(), file_size);
+                        close(filefd);
+                        response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(file_size) + "\r\n\r\n" + body;
+                    }
+                }
                 readyQueue.emplace(m_fd, response);
             }
         }
