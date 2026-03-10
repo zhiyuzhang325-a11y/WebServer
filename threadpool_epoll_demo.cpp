@@ -3,6 +3,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <netinet/in.h>
@@ -72,6 +73,104 @@ void logger(LOGLEVEL level, string message) {
         cout << getTimestamp() << " " << level << ": " << message << endl;
     }
 }
+
+// 时间堆
+
+struct Timer {
+    int fd;
+    int expire_time;
+};
+
+class TimerHeap {
+  public:
+    TimerHeap(vector<Timer> &timers) : m_timers(timers), m_size(timers.size()) {
+        for (int i = (m_size - 2) / 2; i >= 0; i--) {
+            siftDown(i);
+        }
+        for (int i = 0; i < m_size; i++) {
+            m_timers_index[m_timers[i].fd] = i;
+        }
+    }
+
+    TimerHeap() : m_size(0) {}
+
+    void add(const Timer &timer) {
+        m_timers.push_back(timer);
+        siftUp(m_size);
+        m_size++;
+    }
+
+    void tick(function<void(int)> on_expire) {
+        while (m_size > 0 && time(nullptr) > m_timers[0].expire_time) {
+            on_expire(m_timers[0].fd);
+            swap(m_timers[0], m_timers[m_size - 1]);
+            m_timers.pop_back();
+            m_size--;
+            siftDown(0);
+        }
+    }
+
+    int getNextTimeout() {
+        if (m_size == 0) {
+            logger(WARN, "no timer");
+            return -1;
+        }
+        int timeout = m_timers[0].expire_time - time(nullptr) * 1000;
+        logger(DEBUG, "timeout = " + to_string(timeout));
+        return timeout;
+    }
+
+    void update(int fd, int update_time) {
+        int index = m_timers_index[fd];
+        m_timers[index].expire_time = update_time;
+        siftDown(index);
+    }
+
+  private:
+    void siftDown(int index) {
+        while (1) {
+            int left_child = 2 * index + 1;
+            int right_child = 2 * index + 2;
+            int smallest = index;
+
+            if (left_child < m_size && m_timers[left_child].expire_time < m_timers[smallest].expire_time) {
+                smallest = left_child;
+            }
+
+            if (right_child < m_size && m_timers[right_child].expire_time < m_timers[smallest].expire_time) {
+                smallest = right_child;
+            }
+
+            if (smallest == index) {
+                break;
+            }
+
+            swap(m_timers[index], m_timers[smallest]);
+            m_timers_index[m_timers[smallest].fd] = index;
+            index = smallest;
+        }
+        m_timers_index[m_timers[index].fd] = index;
+    }
+
+    void siftUp(int index) {
+        while (1) {
+            int father = (index - 1) / 2;
+            if (m_timers[father].expire_time > m_timers[index].expire_time) {
+                swap(m_timers[father], m_timers[index]);
+                m_timers_index[m_timers[father].fd] = index;
+                index = father;
+            } else {
+                break;
+            }
+        }
+        m_timers_index[m_timers[index].fd] = index;
+    }
+
+  private:
+    int m_size;
+    vector<Timer> m_timers;
+    unordered_map<int, int> m_timers_index;
+};
 
 // 解析http请求状态机
 
@@ -334,14 +433,12 @@ void trySend(Connection &conn) {
             return;
         }
     }
-    logger(DEBUG, "fd = " + to_string(conn.fd) + " send over");
     conn.sendComplete = true;
     if (conn.readClosed) {
         logger(INFO, "send complete, close fd = " + to_string(conn.fd));
         close(conn.fd);
     } else {
-        logger(INFO, "send complete, close fd = " + to_string(conn.fd));
-        close(conn.fd);
+        logger(INFO, "fd = " + to_string(conn.fd) + ", send complete");
     }
 }
 
@@ -374,12 +471,21 @@ int main(int argc, char *argv[]) {
 
     ThreadPool<Task> pool(4);
 
+    TimerHeap heap;
+
     while (1) {
-        int numbers = epoll_wait(epollfd, events, MAXSIZE, -1);
+        int numbers = epoll_wait(epollfd, events, MAXSIZE, heap.getNextTimeout());
         logger(DEBUG, "happened events number = " + to_string(numbers));
         if (numbers < 0) {
             logger(ERROR, "epoll_wait failed");
             break;
+        } else if (numbers == 0) {
+            logger(INFO, "epoll_wait running timeout, run timer tick");
+            heap.tick([](int fd) {
+                logger(INFO, "close inactive connection, fd = " + to_string(fd));
+                close(fd);
+            });
+            continue;
         }
         for (int i = 0; i < numbers; i++) {
             int fd = events[i].data.fd;
@@ -399,6 +505,7 @@ int main(int argc, char *argv[]) {
 
                     addfd(connfd);
                     conns[connfd] = {connfd, "", "", false, false, false};
+                    heap.add(Timer{connfd, int(time(nullptr) * 1000 + 60)});
                     string client_ip;
                     int client_port = ntohs(client_addr.sin_port);
                     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
@@ -425,6 +532,8 @@ int main(int argc, char *argv[]) {
                     localQueue.pop();
                 }
             } else if (events[i].events & EPOLLIN) {
+                heap.update(fd, int(time(nullptr) * 1000 + 60));
+
                 char buf[BUFSIZE];
                 while (1) {
                     int n = recv(fd, buf, BUFSIZE, 0);
