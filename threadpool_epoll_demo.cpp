@@ -3,6 +3,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -35,6 +36,7 @@ struct Connection {
     bool readClosed = false;
     bool sendComplete = false;
     bool processing = false;
+    bool keepAlive = true;
 };
 unordered_map<int, Connection> conns;
 
@@ -50,29 +52,110 @@ mutex logMutex;
 
 // 日志
 
-enum LOGLEVEL {
-    DEBUG, // 调试
-    INFO,  // 信息
-    WARN,  // 警告
-    ERROR, // 错误
-    FATAL  // 致命
+class AsyncLogger {
+  public:
+    enum LOGLEVEL {
+        DEBUG, // 调试
+        INFO,  // 信息
+        WARN,  // 警告
+        ERROR, // 错误
+        FATAL  // 致命
+    };
+
+    AsyncLogger(int flush_threshold) : m_flush_threshold(flush_threshold), m_stop(false) {
+        m_file.open("logs/server.log", ios::app);
+
+        m_backend = thread(&AsyncLogger::backend, this);
+    }
+
+    void log(LOGLEVEL level, const string &message) {
+        string entry = getTimestamp() + " " + levelToString(level) + " " + message;
+        if (level == ERROR) {
+            entry.append(": " + string(strerror(errno)));
+        }
+
+        {
+            lock_guard<mutex> lock(m_mutex);
+            m_buffer_a.push(entry);
+            if (m_buffer_a.size() > m_flush_threshold) {
+                m_cond.notify_one();
+            }
+        }
+    }
+
+    ~AsyncLogger() {
+        {
+            lock_guard<mutex> lock(m_mutex);
+            m_stop = true;
+        }
+
+        m_cond.notify_one();
+        if (m_backend.joinable()) {
+            m_backend.join();
+        }
+    }
+
+  private:
+    string getTimestamp() {
+        auto now = chrono::system_clock::now();
+        auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        time_t t = chrono::system_clock::to_time_t(now);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&t));
+        return string(buf) + "." + to_string(ms.count());
+    }
+
+    string levelToString(LOGLEVEL level) {
+        switch (level) {
+        case DEBUG:
+            return "DEBUG";
+        case INFO:
+            return "INFO";
+        case WARN:
+            return "WARN";
+        case ERROR:
+            return "ERROR";
+        case FATAL:
+            return "FATAL";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
+    void backend() {
+        while (1) {
+            {
+                unique_lock<mutex> lock(m_mutex);
+                m_cond.wait(lock, [this] {
+                    return m_stop || m_buffer_a.size() >= m_flush_threshold;
+                });
+
+                m_buffer_b.swap(m_buffer_a);
+            }
+
+            while (!m_buffer_b.empty()) {
+                m_file << m_buffer_b.front() << '\n';
+                m_buffer_b.pop();
+            }
+
+            if (m_stop) {
+                return;
+            }
+        }
+    }
+
+  private:
+    queue<string> m_buffer_a;
+    queue<string> m_buffer_b;
+    mutex m_mutex;
+    condition_variable m_cond;
+    thread m_backend;
+    bool m_stop = false;
+    int m_flush_threshold;
+    ofstream m_file;
 };
 
-string getTimestamp() {
-    auto now = std::time(nullptr);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-    return buf;
-}
-
-void logger(LOGLEVEL level, string message) {
-    lock_guard<mutex> lock(logMutex);
-    if (level == ERROR || level == FATAL) {
-        cout << getTimestamp() << " " << level << ": " << message << " : " << strerror(errno) << endl;
-    } else {
-        cout << getTimestamp() << " " << level << ": " << message << endl;
-    }
-}
+AsyncLogger logger(5);
 
 // 时间堆
 
@@ -112,11 +195,11 @@ class TimerHeap {
 
     int getNextTimeout() {
         if (m_size == 0) {
-            logger(WARN, "no timer");
+            logger.log(AsyncLogger::WARN, "no timer");
             return -1;
         }
         int timeout = m_timers[0].expire_time - time(nullptr) * 1000;
-        logger(DEBUG, "timeout = " + to_string(timeout));
+        logger.log(AsyncLogger::DEBUG, "timeout = " + to_string(timeout));
         return timeout;
     }
 
@@ -126,8 +209,20 @@ class TimerHeap {
         siftDown(index);
     }
 
+    void remove(int fd) {
+        int index = m_timers_index[fd];
+        swap(m_timers[index], m_timers[m_size - 1]);
+        m_timers_index.erase(fd);
+        m_timers.pop_back();
+        m_size--;
+        if (index < m_size) {
+            index = siftDown(index);
+            siftUp(index);
+        }
+    }
+
   private:
-    void siftDown(int index) {
+    int siftDown(int index) {
         while (1) {
             int left_child = 2 * index + 1;
             int right_child = 2 * index + 2;
@@ -150,9 +245,10 @@ class TimerHeap {
             index = smallest;
         }
         m_timers_index[m_timers[index].fd] = index;
+        return index;
     }
 
-    void siftUp(int index) {
+    int siftUp(int index) {
         while (1) {
             int father = (index - 1) / 2;
             if (m_timers[father].expire_time > m_timers[index].expire_time) {
@@ -164,6 +260,7 @@ class TimerHeap {
             }
         }
         m_timers_index[m_timers[index].fd] = index;
+        return index;
     }
 
   private:
@@ -171,6 +268,8 @@ class TimerHeap {
     vector<Timer> m_timers;
     unordered_map<int, int> m_timers_index;
 };
+
+TimerHeap heap;
 
 // 解析http请求状态机
 
@@ -190,6 +289,7 @@ struct HttpRequest {
     string version;
 
     string host;
+    string connection;
     string content_type;
     int content_length = 0;
 
@@ -210,12 +310,12 @@ ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
             istringstream iss(line);
             iss >> req.method >> req.target >> req.version;
             if (req.method.empty() || req.target.empty() || req.version.empty()) {
-                logger(DEBUG, "request_line parse error");
+                logger.log(AsyncLogger::DEBUG, "request_line parse error");
                 req.state = PARSE_ERROR;
                 break;
             }
             if (req.method != "GET" && req.method != "POST" && req.method != "HEAD") {
-                logger(DEBUG, "request method error, method is " + req.method);
+                logger.log(AsyncLogger::DEBUG, "request method error, method is " + req.method);
                 req.state = PARSE_ERROR;
                 break;
             }
@@ -235,7 +335,7 @@ ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
 
             size_t colon_pos = line.find(':');
             if (colon_pos == string::npos) {
-                logger(DEBUG, "headers parse error");
+                logger.log(AsyncLogger::DEBUG, "headers parse error");
                 req.state = PARSE_ERROR;
                 break;
             }
@@ -243,10 +343,12 @@ ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
             string value = line.substr(colon_pos + 2);
 
             if (key.empty() || value.empty()) {
-                logger(DEBUG, "headers parse error");
+                logger.log(AsyncLogger::DEBUG, "headers parse error");
                 req.state = PARSE_ERROR;
             } else if (key == "Host") {
                 req.host = value;
+            } else if (key == "Connection") {
+                req.connection = value;
             } else if (key == "Content-Type") {
                 req.content_type = value;
             } else if (key == "Content-Length") {
@@ -346,7 +448,7 @@ class Task {
     Task(int fd) : m_fd(fd) {}
 
     void process() {
-        logger(INFO, "Task processing fd = " + to_string(m_fd) + " by thread " + to_string(pthread_self()));
+        logger.log(AsyncLogger::INFO, "Task processing fd = " + to_string(m_fd) + " by thread " + to_string(pthread_self()));
 
         // 模拟耗时操作
         // this_thread::sleep_for(chrono::milliseconds(500));
@@ -355,18 +457,18 @@ class Task {
         {
             lock_guard<mutex> lock(readyMutex);
             if (conns.find(m_fd) != conns.end()) {
-                logger(INFO, "fd = " + to_string(m_fd) + " send data : " + conns[m_fd].inbuf);
+                logger.log(AsyncLogger::INFO, "fd = " + to_string(m_fd) + " send data : " + conns[m_fd].inbuf);
                 HttpRequest req;
                 ParseState ret = parse_http_from_string(conns[m_fd].inbuf, req);
                 if (ret == PARSE_ERROR) {
-                    logger(INFO, "HTTP parse failed, fd = " + to_string(m_fd));
+                    logger.log(AsyncLogger::INFO, "HTTP parse failed, fd = " + to_string(m_fd));
                     response = error_response;
                 } else if (req.target == "/echo") {
                     response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(body.size()) + "\r\n\r\n" + req.body;
                 } else if (req.method == "GET") {
                     string file_path = "static" + req.target;
                     if (req.target == "/") file_path = "static/index.html";
-                    logger(INFO, "file path is " + file_path);
+                    logger.log(AsyncLogger::INFO, "file path is " + file_path);
                     int filefd = open(file_path.c_str(), O_RDONLY);
                     if (filefd == -1) {
                         response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
@@ -382,6 +484,11 @@ class Task {
                     }
                 }
                 readyQueue.emplace(m_fd, response);
+                conns[m_fd].inbuf.clear();
+
+                if (req.connection == "close") {
+                    conns[m_fd].keepAlive = false;
+                }
             }
         }
 
@@ -425,26 +532,28 @@ void trySend(Connection &conn) {
         if (n > 0) {
             conn.outbuf.erase(0, n);
         } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            logger(DEBUG, "write would block, enable EPOLLOUT and send later");
+            logger.log(AsyncLogger::DEBUG, "write would block, enable EPOLLOUT and send later");
             modfd(conn.fd, EPOLLET | EPOLLIN | EPOLLOUT);
             return;
         } else {
-            logger(ERROR, "write failed");
+            logger.log(AsyncLogger::ERROR, "write failed");
             return;
         }
     }
     conn.sendComplete = true;
     if (conn.readClosed) {
-        logger(INFO, "send complete, close fd = " + to_string(conn.fd));
+        logger.log(AsyncLogger::INFO, "send complete, close fd = " + to_string(conn.fd));
+        heap.remove(conn.fd);
         close(conn.fd);
     } else {
-        logger(INFO, "fd = " + to_string(conn.fd) + ", send complete");
+        logger.log(AsyncLogger::INFO, "fd = " + to_string(conn.fd) + ", send complete");
+        if (conn.keepAlive) conn.sendComplete = false;
     }
 }
 
 int main(int argc, char *argv[]) {
     if (argc <= 2) {
-        logger(WARN, "usage: ./threadpool_epoll_demo.out ip port");
+        logger.log(AsyncLogger::WARN, "usage: ./threadpool_epoll_demo.out ip port");
         return -1;
     }
     epollfd = epoll_create(1);
@@ -465,31 +574,29 @@ int main(int argc, char *argv[]) {
     bind(listenfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     listen(listenfd, 1024);
     addfd(listenfd);
-    logger(INFO, "server listening on " + ip + ":" + to_string(port));
+    logger.log(AsyncLogger::INFO, "server listening on " + ip + ":" + to_string(port));
 
     epoll_event events[MAXSIZE];
 
     ThreadPool<Task> pool(4);
 
-    TimerHeap heap;
-
     while (1) {
         int numbers = epoll_wait(epollfd, events, MAXSIZE, heap.getNextTimeout());
-        logger(DEBUG, "happened events number = " + to_string(numbers));
+        logger.log(AsyncLogger::DEBUG, "happened events number = " + to_string(numbers));
         if (numbers < 0) {
-            logger(ERROR, "epoll_wait failed");
+            logger.log(AsyncLogger::ERROR, "epoll_wait failed");
             break;
         } else if (numbers == 0) {
-            logger(INFO, "epoll_wait running timeout, run timer tick");
+            logger.log(AsyncLogger::INFO, "epoll_wait running timeout, run timer tick");
             heap.tick([](int fd) {
-                logger(INFO, "close inactive connection, fd = " + to_string(fd));
+                logger.log(AsyncLogger::INFO, "close inactive connection, fd = " + to_string(fd));
                 close(fd);
             });
             continue;
         }
         for (int i = 0; i < numbers; i++) {
             int fd = events[i].data.fd;
-            logger(DEBUG, "event fd = " + to_string(fd));
+            logger.log(AsyncLogger::DEBUG, "event fd = " + to_string(fd));
             if (fd == listenfd) {
                 while (1) {
                     sockaddr_in client_addr{};
@@ -499,17 +606,17 @@ int main(int argc, char *argv[]) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             break;
                         }
-                        logger(ERROR, "accept failed");
+                        logger.log(AsyncLogger::ERROR, "accept failed");
                         break;
                     }
 
                     addfd(connfd);
-                    conns[connfd] = {connfd, "", "", false, false, false};
+                    conns[connfd] = {connfd, "", "", false, false, false, true};
                     heap.add(Timer{connfd, int(time(nullptr) * 1000 + 60)});
                     string client_ip;
                     int client_port = ntohs(client_addr.sin_port);
                     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
-                    logger(INFO, "new connection, fd = " + to_string(connfd) + " ip = " + client_ip + ":" + to_string(client_port));
+                    logger.log(AsyncLogger::INFO, "new connection, fd = " + to_string(connfd) + " ip = " + client_ip + ":" + to_string(client_port));
                 }
             } else if (fd == notifyfd) {
                 uint64_t val;
@@ -521,7 +628,7 @@ int main(int argc, char *argv[]) {
                     localQueue.swap(readyQueue);
                 }
 
-                logger(DEBUG, "start processing queue, queue len = " + to_string(localQueue.size()));
+                logger.log(AsyncLogger::DEBUG, "start processing queue, queue len = " + to_string(localQueue.size()));
                 while (!localQueue.empty()) {
                     auto &result = localQueue.front();
                     if (conns.find(result.fd) != conns.end()) {
@@ -540,22 +647,24 @@ int main(int argc, char *argv[]) {
                     if (n > 0) {
                         conns[fd].inbuf.append(buf, n);
                     } else if (n == 0) {
-                        logger(INFO, "client closed reading, fd = " + to_string(fd));
+                        logger.log(AsyncLogger::INFO, "client closed reading, fd = " + to_string(fd));
                         conns[fd].readClosed = true;
                         if (conns[fd].sendComplete) {
+                            heap.remove(fd);
                             close(fd);
                         }
                         break;
                     } else {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            if (!conns[fd].processing && !conns[fd].sendComplete) {
+                            if (!conns[fd].processing && conns[fd].keepAlive) {
+                                logger.log(AsyncLogger::DEBUG, "enqueue task for fd = " + to_string(fd));
                                 conns[fd].processing = true;
-                                logger(DEBUG, "enqueue task for fd = " + to_string(fd));
                                 pool.enqueue(new Task(fd));
                             }
                             break;
                         } else {
-                            logger(ERROR, "read failed");
+                            logger.log(AsyncLogger::ERROR, "read failed");
+                            heap.remove(fd);
                             close(fd);
                             break;
                         }
@@ -566,8 +675,14 @@ int main(int argc, char *argv[]) {
                     trySend(conns[fd]);
                 }
             } else {
-                logger(WARN, "something else happened");
+                logger.log(AsyncLogger::WARN, "something else happened");
             }
         }
     }
+
+    close(listenfd);
+    close(epollfd);
+    close(notifyfd);
+
+    return 0;
 }
