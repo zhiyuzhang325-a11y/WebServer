@@ -64,6 +64,9 @@ class AsyncLogger {
 
     AsyncLogger(int flush_threshold) : m_flush_threshold(flush_threshold), m_stop(false) {
         m_file.open("logs/server.log", ios::app);
+        if (!m_file.is_open()) {
+            std::cerr << "log file open failed!" << std::endl;
+        }
 
         m_backend = thread(&AsyncLogger::backend, this);
     }
@@ -126,9 +129,7 @@ class AsyncLogger {
         while (1) {
             {
                 unique_lock<mutex> lock(m_mutex);
-                m_cond.wait(lock, [this] {
-                    return m_stop || m_buffer_a.size() >= m_flush_threshold;
-                });
+                m_cond.wait_for(lock, std::chrono::seconds(3), [this] { return m_stop || m_buffer_a.size() >= m_flush_threshold; });
 
                 m_buffer_b.swap(m_buffer_a);
             }
@@ -137,6 +138,7 @@ class AsyncLogger {
                 m_file << m_buffer_b.front() << '\n';
                 m_buffer_b.pop();
             }
+            m_file.flush();
 
             if (m_stop) {
                 return;
@@ -161,7 +163,7 @@ AsyncLogger logger(5);
 
 struct Timer {
     int fd;
-    int expire_time;
+    long long expire_time;
 };
 
 class TimerHeap {
@@ -184,7 +186,8 @@ class TimerHeap {
     }
 
     void tick(function<void(int)> on_expire) {
-        while (m_size > 0 && time(nullptr) > m_timers[0].expire_time) {
+        while (m_size > 0 && time(nullptr) * 1000ll >= m_timers[0].expire_time) {
+            logger.log(AsyncLogger::DEBUG, "tick: now=" + to_string(time(nullptr) * 1000ll) + " expire=" + to_string(m_timers[0].expire_time));
             on_expire(m_timers[0].fd);
             swap(m_timers[0], m_timers[m_size - 1]);
             m_timers.pop_back();
@@ -194,6 +197,11 @@ class TimerHeap {
     }
 
     int getNextTimeout() {
+        tick([](int fd) {
+            logger.log(AsyncLogger::INFO, "close inactive connection, fd = " + to_string(fd));
+            close(fd);
+        });
+
         if (m_size == 0) {
             logger.log(AsyncLogger::WARN, "no timer");
             return -1;
@@ -203,7 +211,7 @@ class TimerHeap {
         return timeout;
     }
 
-    void update(int fd, int update_time) {
+    void update(int fd, long long update_time) {
         int index = m_timers_index[fd];
         m_timers[index].expire_time = update_time;
         siftDown(index);
@@ -294,10 +302,12 @@ struct HttpRequest {
     int content_length = 0;
 
     string body;
+
+    size_t end_pos;
 };
 
 ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
-    int index = 0;
+    size_t index = 0;
     size_t pos;
     string line;
     while (req.state == PARSE_BODY || (pos = raw.find("\r\n", index)) != string::npos) {
@@ -325,6 +335,7 @@ ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
 
         case PARSE_HEADERS: {
             if (line.empty()) {
+                req.end_pos = index + req.content_length;
                 if (req.content_length > 0) {
                     req.state = PARSE_BODY;
                 } else {
@@ -342,16 +353,19 @@ ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
             string key = line.substr(0, colon_pos);
             string value = line.substr(colon_pos + 2);
 
+            transform(key.begin(), key.end(), key.begin(), ::tolower);
+
             if (key.empty() || value.empty()) {
                 logger.log(AsyncLogger::DEBUG, "headers parse error");
                 req.state = PARSE_ERROR;
-            } else if (key == "Host") {
+            } else if (key == "host") {
                 req.host = value;
-            } else if (key == "Connection") {
+            } else if (key == "connection") {
+                transform(value.begin(), value.end(), value.begin(), ::tolower);
                 req.connection = value;
-            } else if (key == "Content-Type") {
+            } else if (key == "content-type") {
                 req.content_type = value;
-            } else if (key == "Content-Length") {
+            } else if (key == "content-length") {
                 req.content_length = stoi(value);
             }
             break;
@@ -464,7 +478,7 @@ class Task {
                     logger.log(AsyncLogger::INFO, "HTTP parse failed, fd = " + to_string(m_fd));
                     response = error_response;
                 } else if (req.target == "/echo") {
-                    response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(body.size()) + "\r\n\r\n" + req.body;
+                    response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(req.body.size()) + "\r\n\r\n" + req.body;
                 } else if (req.method == "GET") {
                     string file_path = "static" + req.target;
                     if (req.target == "/") file_path = "static/index.html";
@@ -484,9 +498,9 @@ class Task {
                     }
                 }
                 readyQueue.emplace(m_fd, response);
-                conns[m_fd].inbuf.clear();
+                conns[m_fd].inbuf.erase(conns[m_fd].inbuf.begin(), conns[m_fd].inbuf.begin() + req.end_pos);
 
-                if (req.connection == "close") {
+                if (req.version == "HTTP/1.0" || req.connection == "close") {
                     conns[m_fd].keepAlive = false;
                 }
             }
@@ -545,13 +559,19 @@ void trySend(Connection &conn) {
         logger.log(AsyncLogger::INFO, "send complete, close fd = " + to_string(conn.fd));
         heap.remove(conn.fd);
         close(conn.fd);
+    } else if (!conn.keepAlive) {
+        logger.log(AsyncLogger::INFO, "client not keep alive, send complete, close fd = " + to_string(conn.fd));
+        heap.remove(conn.fd);
+        close(conn.fd);
     } else {
         logger.log(AsyncLogger::INFO, "fd = " + to_string(conn.fd) + ", send complete");
-        if (conn.keepAlive) conn.sendComplete = false;
+        conn.sendComplete = false;
     }
 }
 
 int main(int argc, char *argv[]) {
+    logger.log(AsyncLogger::INFO, "\nserver starting");
+
     if (argc <= 2) {
         logger.log(AsyncLogger::WARN, "usage: ./threadpool_epoll_demo.out ip port");
         return -1;
@@ -612,7 +632,7 @@ int main(int argc, char *argv[]) {
 
                     addfd(connfd);
                     conns[connfd] = {connfd, "", "", false, false, false, true};
-                    heap.add(Timer{connfd, int(time(nullptr) * 1000 + 60)});
+                    heap.add(Timer{connfd, (time(nullptr) * 1000ll + 6000)});
                     string client_ip;
                     int client_port = ntohs(client_addr.sin_port);
                     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
@@ -639,7 +659,7 @@ int main(int argc, char *argv[]) {
                     localQueue.pop();
                 }
             } else if (events[i].events & EPOLLIN) {
-                heap.update(fd, int(time(nullptr) * 1000 + 60));
+                heap.update(fd, (time(nullptr) * 1000ll + 6000));
 
                 char buf[BUFSIZE];
                 while (1) {
@@ -647,15 +667,43 @@ int main(int argc, char *argv[]) {
                     if (n > 0) {
                         conns[fd].inbuf.append(buf, n);
                     } else if (n == 0) {
-                        logger.log(AsyncLogger::INFO, "client closed reading, fd = " + to_string(fd));
+                        logger.log(AsyncLogger::INFO, "client closed writing, fd = " + to_string(fd));
                         conns[fd].readClosed = true;
                         if (conns[fd].sendComplete) {
+                            logger.log(AsyncLogger::INFO, "and send has completed, close fd = " + to_string(fd));
                             heap.remove(fd);
                             close(fd);
                         }
                         break;
                     } else {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            size_t head_end_pos = conns[fd].inbuf.find("\r\n\r\n");
+                            if (head_end_pos != string::npos) {
+                                const string key = "Content-Length:";
+                                size_t value_pos = conns[fd].inbuf.find(key);
+                                if (value_pos != string::npos) {
+                                    value_pos += key.size();
+                                    value_pos = conns[fd].inbuf.find_first_not_of(' ', value_pos);
+
+                                    if (value_pos != string::npos) {
+                                        size_t value_end = conns[fd].inbuf.find("\r\n", value_pos);
+                                        int value = stoi(conns[fd].inbuf.substr(value_pos, value_end - value_pos));
+
+                                        size_t body_start_pos = head_end_pos + 4;
+                                        size_t body_size = conns[fd].inbuf.size() - body_start_pos;
+                                        if (body_size < value) {
+                                            logger.log(AsyncLogger::WARN, "HTTP body incomplete, received body size = " + to_string(body_size) + " ,expected = " + to_string(value));
+                                            break;
+                                        } else {
+                                            logger.log(AsyncLogger::DEBUG, "HTTP received complete");
+                                        }
+                                    } else {
+                                        logger.log(AsyncLogger::WARN, "HTTP incomplete or error");
+                                        break;
+                                    }
+                                }
+                            }
+
                             if (!conns[fd].processing && conns[fd].keepAlive) {
                                 logger.log(AsyncLogger::DEBUG, "enqueue task for fd = " + to_string(fd));
                                 conns[fd].processing = true;
