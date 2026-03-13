@@ -7,6 +7,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <mysql/mysql.h>
 #include <netinet/in.h>
 #include <queue>
 #include <sstream>
@@ -28,6 +29,8 @@ string error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
 
 int epollfd;
 int notifyfd;
+
+hash<string> hasher;
 
 struct Connection {
     int fd;
@@ -387,6 +390,145 @@ ParseState parse_http_from_string(const string &raw, HttpRequest &req) {
     return req.state;
 }
 
+// 连接池
+
+class MysqlPool;
+
+class ConnGuard {
+  public:
+    ConnGuard(MysqlPool *pool);
+    ~ConnGuard();
+    MYSQL *get() {
+        return m_fd;
+    }
+
+  private:
+    MysqlPool *m_pool;
+    MYSQL *m_fd;
+};
+
+class MysqlPool {
+    friend class ConnGuard;
+
+  public:
+    MysqlPool(int max_connections) {
+        for (int i = 0; i < max_connections; i++) {
+            MYSQL *connfd = mysql_init(nullptr);
+            if (connfd == nullptr) {
+                logger.log(AsyncLogger::ERROR, "mysql_init failed");
+                continue;
+            }
+
+            MYSQL *ret = mysql_real_connect(connfd, "127.0.0.1", "root", "123456", "webserver", 3306, nullptr, 0);
+            if (ret == nullptr) {
+                logger.log(AsyncLogger::ERROR, "mysql_real_connect failed");
+                mysql_close(connfd);
+                continue;
+            }
+
+            m_ready_queue.push(connfd);
+        }
+    }
+
+    unsigned int executeQuery(const string &sql, string &result_text) {
+        MYSQL *fd;
+        int num_fields;
+
+        {
+            ConnGuard guard(this);
+            fd = guard.get();
+
+            int ret = mysql_query(fd, sql.c_str());
+            if (ret != 0) {
+                logger.log(AsyncLogger::ERROR, "mysql_query failed");
+                return -1;
+            }
+
+            MYSQL_RES *result = mysql_store_result(fd);
+            num_fields = mysql_num_fields(result);
+
+            MYSQL_ROW row;
+            while ((row = mysql_fetch_row(result)) != nullptr) {
+                for (int i = 0; i < num_fields; i++) {
+                    if (row[i] != nullptr) {
+                        result_text.append(row[i]);
+                        result_text.append(" ");
+                    } else {
+                        result_text.append("NULL ");
+                    }
+                }
+            }
+            if (!result_text.empty()) {
+                result_text.pop_back();
+            }
+
+            mysql_free_result(result);
+        }
+
+        return num_fields;
+    }
+
+    bool executeQuery(const string &sql) {
+        MYSQL *fd;
+
+        {
+            ConnGuard guard(this);
+            fd = guard.get();
+
+            int ret = mysql_query(fd, sql.c_str());
+            if (ret != 0) {
+                logger.log(AsyncLogger::ERROR, "mysql_query failed: " + string(mysql_error(fd)));
+                return false;
+            } else {
+                logger.log(AsyncLogger::INFO, "success, affected rows = " + mysql_affected_rows(fd));
+            }
+        }
+
+        return true;
+    }
+
+  private:
+    queue<MYSQL *> m_ready_queue;
+    mutex m_mutex;
+    condition_variable m_cond;
+};
+
+ConnGuard::ConnGuard(MysqlPool *pool) : m_pool(pool) {
+    {
+        unique_lock<mutex> lock(pool->m_mutex);
+        pool->m_cond.wait(lock, [pool] {
+            return !pool->m_ready_queue.empty();
+        });
+
+        m_fd = pool->m_ready_queue.front();
+        pool->m_ready_queue.pop();
+    }
+}
+
+ConnGuard::~ConnGuard() {
+    {
+        lock_guard<mutex> lock(m_pool->m_mutex);
+        m_pool->m_ready_queue.push(m_fd);
+        m_pool->m_cond.notify_one();
+    }
+}
+
+MysqlPool mysql_pool(5);
+
+string escapeSqlString(const string &s) {
+    string result;
+    result.reserve(s.size() * 2);
+
+    for (char c : s) {
+        if (c == '\'') {
+            result += "''";
+        } else {
+            result += c;
+        }
+    }
+    return result;
+}
+
 // 线程池
 
 template <typename T>
@@ -457,6 +599,16 @@ class ThreadPool {
 
 // 任务类
 
+string generateSalt(int len = 16) {
+    static const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    string salt;
+    srand(time(nullptr));
+    for (int i = 0; i < len; i++) {
+        salt += charset[rand() % (sizeof(charset) - 1)];
+    }
+    return salt;
+}
+
 class Task {
   public:
     Task(int fd) : m_fd(fd) {}
@@ -472,13 +624,70 @@ class Task {
             lock_guard<mutex> lock(readyMutex);
             if (conns.find(m_fd) != conns.end()) {
                 logger.log(AsyncLogger::INFO, "fd = " + to_string(m_fd) + " send data : " + conns[m_fd].inbuf);
+
                 HttpRequest req;
                 ParseState ret = parse_http_from_string(conns[m_fd].inbuf, req);
+
                 if (ret == PARSE_ERROR) {
                     logger.log(AsyncLogger::INFO, "HTTP parse failed, fd = " + to_string(m_fd));
                     response = error_response;
                 } else if (req.target == "/echo") {
                     response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(req.body.size()) + "\r\n\r\n" + req.body;
+                } else if (req.target == "/register" || req.target == "/login") {
+                    string username_key = "username=";
+                    size_t username_value_pos = req.body.find(username_key);
+
+                    string password_key = "password=";
+                    size_t password_value_pos = req.body.find(password_key);
+
+                    if (username_value_pos == string::npos || password_value_pos == string::npos) {
+                        logger.log(AsyncLogger::WARN, "register request not have username or password");
+                        response = "HTTP / 1.1 400 Unauthorized\r\nContent - Type : text / plain\r\nContent - Length : 26\r\n\r\nmissing username or password";
+                    } else {
+                        size_t username_start = username_value_pos + username_key.size();
+                        size_t username_end = req.body.find("&", username_start);
+                        string username = req.body.substr(username_start, username_end - username_start);
+                        username = escapeSqlString(username);
+
+                        size_t password_start = password_value_pos + password_key.size();
+                        size_t password_end = req.body.find("&", password_start);
+                        string password = req.body.substr(password_start, password_end - password_start);
+                        password = escapeSqlString(password);
+
+                        if (req.target == "/register") {
+                            string salt = generateSalt();
+
+                            string password_hash = to_string(hasher(password + salt));
+
+                            int ret = mysql_pool.executeQuery("INSERT INTO users (username, password_hash, salt) VALUES ('" + username + "', '" + password_hash + "', '" + salt + "')");
+
+                            if (ret) {
+                                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 16\r\n\r\nregister success";
+                            } else {
+                                response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\nregister failed";
+                            }
+                        } else {
+                            string result_text;
+                            mysql_pool.executeQuery("SELECT password_hash, salt FROM users WHERE username = '" + username + "'", result_text);
+
+                            if (result_text.empty()) {
+                                logger.log(AsyncLogger::WARN, "login: user not found");
+                                response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nlogin failed";
+                            } else {
+                                string password_hash = result_text.substr(0, result_text.find(" "));
+
+                                result_text.erase(result_text.begin(), result_text.begin() + password_hash.size() + 1);
+
+                                string salt = result_text;
+
+                                if (to_string(hasher(password + salt)) == password_hash) {
+                                    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nlogin success";
+                                } else {
+                                    response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nlogin failed";
+                                }
+                            }
+                        }
+                    }
                 } else if (req.method == "GET") {
                     string file_path = "static" + req.target;
                     if (req.target == "/") file_path = "static/index.html";
@@ -497,6 +706,7 @@ class Task {
                         response = "HTTP/1.1 200 OK\r\nContent-Length: " + to_string(file_size) + "\r\n\r\n" + body;
                     }
                 }
+
                 readyQueue.emplace(m_fd, response);
                 conns[m_fd].inbuf.erase(conns[m_fd].inbuf.begin(), conns[m_fd].inbuf.begin() + req.end_pos);
 
